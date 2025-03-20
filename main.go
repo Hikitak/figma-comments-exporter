@@ -10,175 +10,241 @@ import (
 	"time"
 )
 
+type FigmaFileResponse struct {
+	Name     string `json:"name"`
+	Document struct {
+		Children []Node `json:"children"`
+	} `json:"document"`
+}
+
+type Node struct {
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Children []Node `json:"children,omitempty"`
+	Type     string `json:"type"`
+}
+
+type FigmaCommentResponse struct {
+	Comments []FigmaComment `json:"comments"`
+}
+
 type FigmaComment struct {
 	ID         string     `json:"id"`
-	CreatedAt  string     `json:"created_at"`
+	CreatedAt  time.Time  `json:"created_at"`
 	ResolvedAt *time.Time `json:"resolved_at"`
-	User       FigmaUser  `json:"user"`
-	Message    string     `json:"message"`
+	User       struct {
+		Handle string `json:"handle"`
+		ID     string `json:"id"`
+	} `json:"user"`
+	Message    string `json:"message"`
 	ClientMeta struct {
-		X float64 `json:"x"`
-		Y float64 `json:"y"`
+		NodeID string  `json:"node_id"`
+		X      float64 `json:"x"`
+		Y      float64 `json:"y"`
 	} `json:"client_meta"`
 	ParentID string `json:"parent_id"`
-	Status   string `json:"status"` // "open" или "resolved"
 }
 
-type FigmaUser struct {
-	Handle string `json:"handle"`
-	ID     string `json:"id"`
-}
-
+// Конфигурация
 type Config struct {
-	FileKey string `json:"file_key"`
-	Output  string `json:"output"`
-	Token   string `json:"token"`
+	Files  []FileConfig `json:"files"`
+	Output string       `json:"output"`
+	Token  string       `json:"token"`
+}
+
+type FileConfig struct {
+	Key  string `json:"key"`
+	Name string `json:"name,omitempty"`
 }
 
 func main() {
-	config, err := loadOrCreateConfig()
-	if err != nil {
-		log.Fatalf("Ошибка конфигурации: %v", err)
-	}
-
-	comments, err := getFigmaComments(config.FileKey, config.Token)
-	if err != nil {
-		log.Fatalf("Ошибка получения комментариев: %v", err)
-	}
-
-	if err := exportToCSV(comments, config.Output); err != nil {
-		log.Fatalf("Ошибка экспорта: %v", err)
-	}
-
-	fmt.Printf("Экспортировано %d комментариев в %s\n", len(comments), config.Output)
-	fmt.Println("Нажмите Enter чтобы выйти...")
-	fmt.Scanln()
+	config := loadConfig()
+	prepareOutput(config.Output)
+	processFiles(config)
 }
 
-func loadOrCreateConfig() (*Config, error) {
-	const configFile = "config.json"
-
-	if _, err := os.Stat(configFile); os.IsNotExist(err) {
-		defaultConfig := &Config{
-			FileKey: "d0kXYmx5RkCkL1lExeAHFX",
-			Output:  "comments.csv",
-			Token:   "figd_CDl4iC5gX7_Yd4G-h8HWpsgzgsmavTf6kinTEh0c",
-		}
-
-		data, err := json.MarshalIndent(defaultConfig, "", "  ")
-		if err != nil {
-			return nil, fmt.Errorf("ошибка создания конфига: %v", err)
-		}
-
-		if err := os.WriteFile(configFile, data, 0644); err != nil {
-			return nil, fmt.Errorf("ошибка записи конфига: %v", err)
-		}
-
-		return nil, fmt.Errorf("файл конфигурации создан. Заполните config.json и перезапустите программу")
+func loadConfig() *Config {
+	data, err := os.ReadFile("config.json")
+	if err != nil {
+		log.Fatal("Ошибка чтения config.json: ", err)
 	}
 
-	file, err := os.Open(configFile)
+	var config Config
+	if err := json.Unmarshal(data, &config); err != nil {
+		log.Fatal("Ошибка парсинга config.json: ", err)
+	}
+
+	if len(config.Files) == 0 || config.Token == "" {
+		log.Fatal("Некорректная конфигурация")
+	}
+
+	return &config
+}
+
+func processFiles(config *Config) {
+	file, err := os.Create(config.Output)
 	if err != nil {
-		return nil, fmt.Errorf("ошибка открытия конфига: %v", err)
+		log.Fatal("Ошибка создания файла: ", err)
 	}
 	defer file.Close()
 
-	var config Config
-	if err := json.NewDecoder(file).Decode(&config); err != nil {
-		return nil, fmt.Errorf("ошибка чтения конфига: %v", err)
+	writer := csv.NewWriter(file)
+	defer writer.Flush()
+	file.Write([]byte{0xEF, 0xBB, 0xBF})
+	writer.Comma = ';'
+
+	writeHeaders(writer)
+
+	for _, f := range config.Files {
+		processSingleFile(f, config.Token, writer)
 	}
 
-	if config.FileKey == "" || config.Token == "" {
-		return nil, fmt.Errorf("заполните все поля в config.json")
-	}
-
-	return &config, nil
+	fmt.Printf("\nЭкспортировано в: %s\n", config.Output)
+	fmt.Println("Нажмите Enter для выхода...")
+	fmt.Scanln()
 }
 
-func getFigmaComments(fileKey, token string) ([]FigmaComment, error) {
-	url := fmt.Sprintf("https://api.figma.com/v1/files/%s/comments", fileKey)
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
+func processSingleFile(file FileConfig, token string, writer *csv.Writer) {
+	fmt.Printf("Обработка файла: %s... ", file.Key)
 
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	// 1. Получение комментариев
+	comments, nodesIds, err := getComments(file.Key, token)
+	if err != nil {
+		log.Printf("\nОшибка получения комментариев: %v", err)
+		return
+	}
+
+	// 2. Получение структуры файла
+	fileStructure, err := getFileStructure(nodesIds, file.Key, token)
+	if err != nil {
+		log.Printf("\nОшибка получения структуры: %v", err)
+		return
+	}
+
+	// 3. Группировка комментариев по node_id
+	commentMap := make(map[string][]FigmaComment)
+	for _, c := range comments {
+		if c.ParentID == "" && c.ClientMeta.NodeID != "" {
+			commentMap[c.ClientMeta.NodeID] = append(commentMap[c.ClientMeta.NodeID], c)
+		}
+	}
+
+	// 4. Обработка узлов
+	fileName := file.Name
+	if fileName == "" {
+		fileName = fileStructure.Name
+	}
+	processNodeRecursive(fileStructure.Document.Children, fileName, file.Key, commentMap, writer)
+
+	fmt.Println("Готово")
+}
+
+func getFileStructure(nodesIds, fileKey, token string) (*FigmaFileResponse, error) {
+	url := fmt.Sprintf("https://api.figma.com/v1/files/%s/nodes?id=%s", fileKey, nodesIds)
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("X-FIGMA-TOKEN", token)
+
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("API ошибка: %s", resp.Status)
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, resp.Status)
 	}
 
-	var result struct {
-		Comments []FigmaComment `json:"comments"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	var fileResponse FigmaFileResponse
+	if err := json.NewDecoder(resp.Body).Decode(&fileResponse); err != nil {
 		return nil, err
 	}
 
-	var rootComments []FigmaComment
-	for _, comment := range result.Comments {
-		if comment.ParentID == "" {
-			rootComments = append(rootComments, comment)
+	return &fileResponse, nil
+}
+
+func getComments(fileKey, token string) ([]FigmaComment, string, error) {
+	url := fmt.Sprintf("https://api.figma.com/v1/files/%s/comments", fileKey)
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("X-FIGMA-TOKEN", token)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return nil, nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, resp.Status)
+	}
+
+	var commentsResponse FigmaCommentResponse
+	if err := json.NewDecoder(resp.Body).Decode(&commentsResponse); err != nil {
+		return nil, nil, err
+	}
+
+	nodesIds := ""
+	for _, c := range commentsResponse.Comments {
+		if c.ClientMeta.NodeID != nil {
+			nodesIds += c.ClientMeta.NodeID
 		}
 	}
 
-	return rootComments, nil
+	return commentsResponse.Comments, nodesIds, nil
 }
 
-func exportToCSV(comments []FigmaComment, path string) error {
-    file, err := os.Create(path)
-    if err != nil {
-        return err
-    }
-    defer file.Close()
+func processNodeRecursive(nodes []Node, fileName, fileKey string, comments map[string][]FigmaComment, writer *csv.Writer) {
+	for _, node := range nodes {
+		// Обработка текущего узла
+		if comments, exists := comments[node.ID]; exists {
+			for _, comment := range comments {
+				record := []string{
+					fileName,
+					node.Name,
+					node.ID,
+					comment.Message,
+					comment.User.Handle,
+					comment.CreatedAt.Format(time.RFC3339),
+					getCommentStatus(comment.ResolvedAt),
+					fmt.Sprintf("%.2f", comment.ClientMeta.X),
+					fmt.Sprintf("%.2f", comment.ClientMeta.Y),
+					fmt.Sprintf("https://www.figma.com/file/%s/?node-id=%s#%s", fileKey, node.ID, comment.ID),
+				}
+				writer.Write(record)
+			}
+		}
 
-    writer := csv.NewWriter(file)
-    defer writer.Flush()
+		// Рекурсивная обработка дочерних узлов
+		if len(node.Children) > 0 {
+			processNodeRecursive(node.Children, fileName, fileKey, comments, writer)
+		}
+	}
+}
 
-    // Добавляем новые заголовки
-    headers := []string{
-        "ID",
-        "Дата создания",
-        "Статус",
-        "Дата разрешения",
-        "Пользователь",
-        "ID пользователя",
-        "Сообщение",
-        "X",
-        "Y",
-    }
+func getCommentStatus(resolvedAt *time.Time) string {
+	if resolvedAt != nil {
+		return "resolved"
+	}
+	return "open"
+}
 
-    if err := writer.Write(headers); err != nil {
-        return err
-    }
+func writeHeaders(writer *csv.Writer) {
+	headers := []string{
+		"Файл",
+		"Нода",
+		"ID ноды",
+		"Комментарий",
+		"Автор",
+		"Дата создания",
+		"Статус",
+		"X",
+		"Y",
+		"Ссылка",
+	}
+	writer.Write(headers)
+}
 
-    for _, comment := range comments {
-        resolvedAt := ""
-        if comment.ResolvedAt != nil {
-            resolvedAt = comment.ResolvedAt.Format(time.RFC3339)
-        }
-
-        record := []string{
-            comment.ID,
-            comment.CreatedAt,
-            comment.Status,
-            resolvedAt,
-            comment.User.Handle,
-            comment.User.ID,
-            comment.Message,
-            fmt.Sprintf("%.2f", comment.ClientMeta.X),
-            fmt.Sprintf("%.2f", comment.ClientMeta.Y),
-        }
-        if err := writer.Write(record); err != nil {
-            return err
-        }
-    }
-
-    return nil
+func prepareOutput(filename string) {
+	if _, err := os.Stat(filename); err == nil {
+		os.Remove(filename)
+	}
 }
