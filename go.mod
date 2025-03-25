@@ -1,1 +1,3 @@
-module figma-comments-exporter
+module figma-comments-exporter.local
+
+go 1.21.3
