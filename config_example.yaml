@@ -1,0 +1,5 @@
+figma:
+  token: "your_figma_token"
+  file_keys:
+    - "file_key1"
+    - "file_key2"
