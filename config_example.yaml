@@ -3,3 +3,17 @@ figma:
   file_keys:
     - "file_key1"
     - "file_key2"
+
+schedule: "0 9 * * *"  # Every day at 09:00 UTC
+
+email:
+  smtp_host: "smtp.example.com"
+  smtp_port: 587
+  smtp_username: "user@example.com"
+  smtp_password: "password"
+  from: "noreply@example.com"
+  to:
+    - "user1@example.com"
+    - "user2@example.com"
+  subject: "Figma Comments Report"
+  body: "Attached is the latest Figma comments report."
